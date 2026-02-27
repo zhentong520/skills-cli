@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+      - name: Build fat jar
+        run: ./gradlew fatJar --no-daemon
+      - name: Run skills-cli on repository (self-scan)
+        run: |
+          java -jar build/libs/skills-cli-all.jar --path . --report text --enable-spotbugs=false --enable-pmd=false
+      - name: Archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skills-cli-jar
+          path: build/libs/skills-cli-all.jar

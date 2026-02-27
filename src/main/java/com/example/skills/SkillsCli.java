@@ -1,0 +1,537 @@
+package com.example.skills;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.googlejavaformat.java.Formatter;
+import com.google.googlejavaformat.java.FormatterException;
+import info.picocli.CommandLine;
+import info.picocli.CommandLine.*;
+import com.puppycrawl.tools.checkstyle.api.*;
+import com.puppycrawl.tools.checkstyle.Checker;
+import com.puppycrawl.tools.checkstyle.ConfigurationLoader;
+import com.puppycrawl.tools.checkstyle.PropertyResolver;
+import org.w3c.dom.*;
+import org.xml.sax.InputSource;
+
+import javax.tools.*;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * skills-cli 主程序（支持 Maven + Gradle 风格项目）
+ * 增强：解析 SpotBugs / PMD 生成的 XML 报告并将每条 issue 转为内部 Issue。
+ */
+@Command(name = "skills", mixinStandardHelpOptions = true, version = "skills 0.3")
+public class SkillsCli implements Callable<Integer> {
+
+    @Option(names = {"--path"}, description = "Project path", defaultValue = ".")
+    String path;
+
+    @Option(names = {"--auto-fix"}, description = "Apply automatic fixes where safe")
+    boolean autoFix = false;
+
+    @Option(names = {"--fix-level"}, description = "Fix level: none|safe|risky", defaultValue = "safe")
+    String fixLevel;
+
+    @Option(names = {"--report"}, description = "Report format: text|json", defaultValue = "text")
+    String reportFormat;
+
+    @Option(names = {"--enable-spotbugs"}, description = "Try to run SpotBugs (if requested)", defaultValue = "false")
+    boolean enableSpotbugs;
+
+    @Option(names = {"--enable-pmd"}, description = "Try to run PMD (if requested)", defaultValue = "false")
+    boolean enablePmd;
+
+    private final List<Issue> issues = new ArrayList<>();
+
+    public static void main(String[] args) {
+        int exitCode = new CommandLine(new SkillsCli()).execute(args);
+        System.exit(exitCode);
+    }
+
+    @Override
+    public Integer call() throws Exception {
+        Path projectRoot = Paths.get(path).toAbsolutePath().normalize();
+        if (!Files.exists(projectRoot)) {
+            System.err.println("Path does not exist: " + projectRoot);
+            return 2;
+        }
+
+        boolean isMaven = isMavenProject(projectRoot);
+        if (isMaven) {
+            issues.add(Issue.info("PROJECT_TYPE", "Detected Maven project (pom.xml found).", projectRoot.toString(), 0));
+        }
+
+        List<Path> javaFiles = collectJavaFiles(projectRoot);
+        if (javaFiles.isEmpty()) {
+            System.out.println("No .java files found under " + projectRoot);
+            return 0;
+        }
+
+        runCompilationChecks(javaFiles, projectRoot);
+        runGoogleFormatChecks(javaFiles, projectRoot);
+        runCheckstyle(javaFiles, projectRoot);
+
+        // Try SpotBugs / PMD (prefer Maven if it's a maven project)
+        if (enableSpotbugs) {
+            if (isMaven) {
+                runMavenGoalsIfAvailable(List.of("spotbugs:spotbugs"), projectRoot);
+            } else {
+                runExternalToolIfAvailable("spotbugs", List.of("-textui", "-effort:max", projectRoot.toString()), projectRoot);
+            }
+            // after running, try to discover and parse reports (both maven and gradle default locations)
+            discoverAndParseSpotBugsReports(projectRoot);
+        }
+
+        if (enablePmd) {
+            if (isMaven) {
+                runMavenGoalsIfAvailable(List.of("pmd:pmd"), projectRoot);
+            } else {
+                runExternalToolIfAvailable("pmd", List.of("check", "-d", projectRoot.toString(), "-f", "text"), projectRoot);
+            }
+            discoverAndParsePmdReports(projectRoot);
+        }
+
+        outputReport();
+
+        boolean hasErrors = issues.stream().anyMatch(i -> i.severity == Severity.ERROR);
+        return hasErrors ? 1 : 0;
+    }
+
+    private boolean isMavenProject(Path root) {
+        return Files.exists(root.resolve("pom.xml"));
+    }
+
+    private List<Path> collectJavaFiles(Path root) throws IOException {
+        try (Stream<Path> s = Files.walk(root)) {
+            return s.filter(p -> p.toString().endsWith(".java"))
+                    .collect(Collectors.toList());
+        }
+    }
+
+    // 1) Compilation checks (syntax + basic semantic via javac)
+    private void runCompilationChecks(List<Path> files, Path root) throws IOException {
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        if (compiler == null) {
+            issues.add(Issue.error("COMPILER_UNAVAILABLE", "Java compiler not found (ensure running on a JDK)", root.toString(), 0));
+            return;
+        }
+        DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+        StandardJavaFileManager fileManager = compiler.getStandardFileManager(diagnostics, null, StandardCharsets.UTF_8);
+
+        Iterable<? extends JavaFileObject> compilationUnits = fileManager.getJavaFileObjectsFromFiles(
+                files.stream().map(Path::toFile).collect(Collectors.toList())
+        );
+
+        JavaCompiler.CompilationTask task = compiler.getTask(null, fileManager, diagnostics, Arrays.asList("-Xlint:all"), null, compilationUnits);
+        task.call();
+
+        for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
+            Severity sev = diagnostic.getKind() == Diagnostic.Kind.ERROR ? Severity.ERROR : Severity.WARNING;
+            String filename = diagnostic.getSource() == null ? root.toString() : diagnostic.getSource().getName();
+            int line = (int) diagnostic.getLineNumber();
+            Issue iss = new Issue(sev, "COMPILER_" + diagnostic.getKind().toString(),
+                    diagnostic.getMessage(Locale.getDefault()), filename, line);
+            iss.suggestion = "Fix the code at the indicated line. Compiler message: " + diagnostic.getMessage(Locale.getDefault());
+            issues.add(iss);
+        }
+    }
+
+    // 2) google-java-format: check and optionally auto-fix
+    private void runGoogleFormatChecks(List<Path> files, Path root) throws IOException {
+        Formatter formatter = new Formatter();
+        for (Path p : files) {
+            String original = Files.readString(p);
+            String formatted;
+            try {
+                formatted = formatter.formatSource(original);
+            } catch (FormatterException e) {
+                issues.add(Issue.warning("FORMATTER_FAIL", "google-java-format failed: " + e.getMessage(), p.toString(), 0));
+                continue;
+            }
+            if (!original.equals(formatted)) {
+                Issue iss = new Issue(Severity.WARNING, "FORMAT", "File not formatted according to google-java-format", p.toString(), 0);
+                iss.suggestion = "Run google-java-format or enable --auto-fix to apply formatting.";
+                iss.patch = "Formatting changes (google-java-format)";
+                issues.add(iss);
+                if (autoFix && ("safe".equalsIgnoreCase(fixLevel) || "risky".equalsIgnoreCase(fixLevel))) {
+                    Files.writeString(p, formatted, StandardCharsets.UTF_8);
+                    iss.appliedFix = true;
+                    iss.suggestion = "Auto-applied google-java-format formatting.";
+                }
+            }
+        }
+    }
+
+    // 3) Checkstyle using built-in google_checks.xml
+    private void runCheckstyle(List<Path> files, Path root) {
+        try (InputStream confStream = SkillsCli.class.getResourceAsStream("/google_checks.xml")) {
+            if (confStream == null) {
+                issues.add(Issue.warning("CHECKSTYLE_CFG_MISSING", "Checkstyle config (google_checks.xml) not found in resources", root.toString(), 0));
+                return;
+            }
+            Configuration config = ConfigurationLoader.loadConfiguration(
+                    new InputSource(confStream),
+                    new PropertiesExpander(new Properties()),
+                    false
+            );
+
+            Checker checker = new Checker();
+            checker.setModuleClassLoader(Checker.class.getClassLoader());
+            List<AuditEvent> events = new ArrayList<>();
+            checker.addListener(new AuditListener() {
+                @Override
+                public void auditStarted(AuditEvent auditEvent) {}
+
+                @Override
+                public void auditFinished(AuditEvent auditEvent) {}
+
+                @Override
+                public void fileStarted(AuditEvent auditEvent) {}
+
+                @Override
+                public void fileFinished(AuditEvent auditEvent) {}
+
+                @Override
+                public void addError(AuditEvent auditEvent) {
+                    events.add(auditEvent);
+                }
+
+                @Override
+                public void addException(AuditEvent auditEvent, Throwable throwable) {
+                    issues.add(Issue.warning("CHECKSTYLE_EXCEPTION", "Checkstyle exception: " + throwable.getMessage(), auditEvent.getFileName(), 0));
+                }
+            });
+
+            checker.configure(config);
+
+            List<String> fileNames = files.stream().map(Path::toString).collect(Collectors.toList());
+            checker.process(fileNames.stream().map(File::new).collect(Collectors.toList()));
+            checker.destroy();
+
+            for (AuditEvent e : events) {
+                int line = e.getLine();
+                Issue iss = new Issue(
+                        Severity.WARNING,
+                        "CHECKSTYLE_" + e.getSeverityLevel().getName(),
+                        e.getMessage(),
+                        e.getFileName(),
+                        line
+                );
+                iss.suggestion = "Follow the style rule (" + e.getModuleId() + "). Consider applying google-java-format or adjusting code.";
+                issues.add(iss);
+            }
+
+        } catch (Exception ex) {
+            issues.add(Issue.warning("CHECKSTYLE_FAIL", "Failed to run Checkstyle: " + ex.getMessage(), root.toString(), 0));
+        }
+    }
+
+    // Try to execute external tool (spotbugs / pmd) if available on PATH (non-maven mode)
+    private void runExternalToolIfAvailable(String cmd, List<String> args, Path projectRoot) {
+        try {
+            ProcessBuilder whichPb = new ProcessBuilder(isWindows() ? "where" : "which", cmd);
+            Process which = whichPb.start();
+            int exit = which.waitFor();
+            if (exit != 0) {
+                issues.add(Issue.info("TOOL_MISSING", cmd + " not found on PATH. Skipping " + cmd + " step.", projectRoot.toString(), 0));
+                return;
+            }
+
+            List<String> fullCmd = new ArrayList<>();
+            fullCmd.add(cmd);
+            fullCmd.addAll(args);
+
+            ProcessBuilder pb = new ProcessBuilder(fullCmd);
+            pb.directory(projectRoot.toFile());
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    // Capture as INFO/WARNING lines; parsing can be improved per-tool
+                    issues.add(Issue.info(cmd.toUpperCase() + "_OUTPUT", line, projectRoot.toString(), 0));
+                }
+            }
+            p.waitFor();
+
+            // Try discover and parse xml reports if produced by the tool
+            if ("spotbugs".equalsIgnoreCase(cmd)) {
+                discoverAndParseSpotBugsReports(projectRoot);
+            } else if ("pmd".equalsIgnoreCase(cmd)) {
+                discoverAndParsePmdReports(projectRoot);
+            }
+
+        } catch (Exception e) {
+            issues.add(Issue.warning("EXTERNAL_TOOL_FAIL", "Failed to run " + cmd + ": " + e.getMessage(), projectRoot.toString(), 0));
+        }
+    }
+
+    // Prefer running via Maven when project is a Maven project
+    private void runMavenGoalsIfAvailable(List<String> goals, Path projectRoot) {
+        try {
+            // Check mvn exists
+            ProcessBuilder whichPb = new ProcessBuilder(isWindows() ? "where" : "which", "mvn");
+            Process which = whichPb.start();
+            int exit = which.waitFor();
+            if (exit != 0) {
+                issues.add(Issue.info("MVN_MISSING", "maven (mvn) not found on PATH. Skipping mvn goals: " + String.join(" ", goals), projectRoot.toString(), 0));
+                return;
+            }
+
+            List<String> fullCmd = new ArrayList<>();
+            fullCmd.add("mvn");
+            fullCmd.add("-B");
+            fullCmd.addAll(goals);
+            fullCmd.add("-DskipTests");
+
+            ProcessBuilder pb = new ProcessBuilder(fullCmd);
+            pb.directory(projectRoot.toFile());
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    issues.add(Issue.info("MVN_OUTPUT", line, projectRoot.toString(), 0));
+                }
+            }
+            p.waitFor();
+        } catch (Exception e) {
+            issues.add(Issue.warning("MVN_FAIL", "Failed to run mvn goals: " + e.getMessage(), projectRoot.toString(), 0));
+        }
+    }
+
+    // Discover common SpotBugs report file paths and parse any found XML reports
+    private void discoverAndParseSpotBugsReports(Path projectRoot) {
+        List<Path> candidates = List.of(
+                projectRoot.resolve("target/spotbugsXml.xml"),
+                projectRoot.resolve("target/spotbugs/spotbugsXml.xml"),
+                projectRoot.resolve("target/spotbugs/spotbugs.xml"),
+                projectRoot.resolve("build/reports/spotbugs/spotbugsXml.xml"),
+                projectRoot.resolve("build/reports/spotbugs/main.xml")
+        );
+        for (Path p : candidates) {
+            if (Files.exists(p)) {
+                try {
+                    parseSpotBugsXml(p);
+                    issues.add(Issue.info("SPOTBUGS_PARSED", "Parsed SpotBugs report: " + p.toString(), p.toString(), 0));
+                } catch (Exception e) {
+                    issues.add(Issue.warning("SPOTBUGS_PARSE_FAIL", "Failed to parse SpotBugs XML " + p + ": " + e.getMessage(), p.toString(), 0));
+                }
+            }
+        }
+    }
+
+    // Discover common PMD report file paths and parse any found XML reports
+    private void discoverAndParsePmdReports(Path projectRoot) {
+        List<Path> candidates = List.of(
+                projectRoot.resolve("target/pmd.xml"),
+                projectRoot.resolve("target/site/pmd.xml"),
+                projectRoot.resolve("build/reports/pmd/main.xml"),
+                projectRoot.resolve("build/reports/pmd/pmd.xml")
+        );
+        for (Path p : candidates) {
+            if (Files.exists(p)) {
+                try {
+                    parsePmdXml(p);
+                    issues.add(Issue.info("PMD_PARSED", "Parsed PMD report: " + p.toString(), p.toString(), 0));
+                } catch (Exception e) {
+                    issues.add(Issue.warning("PMD_PARSE_FAIL", "Failed to parse PMD XML " + p + ": " + e.getMessage(), p.toString(), 0));
+                }
+            }
+        }
+    }
+
+    // Parse SpotBugs XML (basic): convert <BugInstance> -> Issue
+    private void parseSpotBugsXml(Path xmlPath) throws Exception {
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        DocumentBuilder db = dbf.newDocumentBuilder();
+        try (InputStream in = Files.newInputStream(xmlPath)) {
+            Document doc = db.parse(in);
+            NodeList bugs = doc.getElementsByTagName("BugInstance");
+            for (int i = 0; i < bugs.getLength(); i++) {
+                Element bug = (Element) bugs.item(i);
+                String type = bug.getAttribute("type");
+                String priority = bug.getAttribute("priority"); // some reports use priority/rank
+                String rank = bug.getAttribute("rank");
+                String message = type + (priority != null && !priority.isEmpty() ? " priority=" + priority : "") +
+                        (rank != null && !rank.isEmpty() ? " rank=" + rank : "");
+
+                // find SourceLine or Class
+                String sourceFile = xmlPath.toString();
+                int line = 0;
+                NodeList sourceLines = bug.getElementsByTagName("SourceLine");
+                if (sourceLines.getLength() > 0) {
+                    Element sl = (Element) sourceLines.item(0);
+                    String sourcepath = sl.getAttribute("sourcepath");
+                    String start = sl.getAttribute("start");
+                    if (sourcepath != null && !sourcepath.isEmpty()) {
+                        sourceFile = resolveSourceFile(xmlPath.getParent(), sourcepath);
+                    }
+                    if (start != null && !start.isEmpty()) {
+                        try { line = Integer.parseInt(start); } catch (NumberFormatException ignored) {}
+                    }
+                } else {
+                    NodeList classes = bug.getElementsByTagName("Class");
+                    if (classes.getLength() > 0) {
+                        Element cls = (Element) classes.item(0);
+                        String classname = cls.getAttribute("classname");
+                        sourceFile = classname != null ? classname.replace('.', '/') + ".java" : sourceFile;
+                    }
+                }
+
+                Issue iss = new Issue(Severity.WARNING, "SPOTBUGS_" + type, message, sourceFile, line);
+                iss.suggestion = "Review SpotBugs report: type=" + type + ". Consider fixing the root cause reported by SpotBugs.";
+                issues.add(iss);
+            }
+        }
+    }
+
+    // Parse PMD XML (basic): convert <file>/<violation> -> Issue
+    private void parsePmdXml(Path xmlPath) throws Exception {
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        DocumentBuilder db = dbf.newDocumentBuilder();
+        try (InputStream in = Files.newInputStream(xmlPath)) {
+            Document doc = db.parse(in);
+            NodeList fileNodes = doc.getElementsByTagName("file");
+            for (int i = 0; i < fileNodes.getLength(); i++) {
+                Element fileElem = (Element) fileNodes.item(i);
+                String filename = fileElem.getAttribute("name");
+                NodeList violations = fileElem.getElementsByTagName("violation");
+                for (int j = 0; j < violations.getLength(); j++) {
+                    Element v = (Element) violations.item(j);
+                    String beginLine = v.getAttribute("beginline");
+                    int line = 0;
+                    if (beginLine != null && !beginLine.isEmpty()) {
+                        try { line = Integer.parseInt(beginLine); } catch (NumberFormatException ignored) {}
+                    }
+                    String rule = v.getAttribute("rule");
+                    String ruleset = v.getAttribute("ruleset");
+                    String message = v.getTextContent();
+                    Issue iss = new Issue(Severity.WARNING, "PMD_" + rule, (message != null ? message.trim() : "PMD violation"), filename, line);
+                    iss.suggestion = "PMD rule: " + rule + " (ruleset: " + ruleset + "). Review and refactor code to comply with the rule.";
+                    issues.add(iss);
+                }
+            }
+            // older PMD format wraps violations directly under <pmd>, handle if necessary
+            if (fileNodes.getLength() == 0) {
+                NodeList violations = doc.getElementsByTagName("violation");
+                for (int j = 0; j < violations.getLength(); j++) {
+                    Element v = (Element) violations.item(j);
+                    String filename = v.getAttribute("filename");
+                    String beginLine = v.getAttribute("beginline");
+                    int line = 0;
+                    if (beginLine != null && !beginLine.isEmpty()) {
+                        try { line = Integer.parseInt(beginLine); } catch (NumberFormatException ignored) {}
+                    }
+                    String rule = v.getAttribute("rule");
+                    String message = v.getTextContent();
+                    Issue iss = new Issue(Severity.WARNING, "PMD_" + (rule == null ? "VIOLATION" : rule), (message != null ? message.trim() : "PMD violation"), filename, line);
+                    iss.suggestion = "PMD rule: " + rule + ". Review and refactor code to comply with the rule.";
+                    issues.add(iss);
+                }
+            }
+        }
+    }
+
+    // Try to resolve a relative source path to an existing file under project (best-effort)
+    private String resolveSourceFile(Path base, String sourcepath) {
+        // Attempt common roots: project root, base, src/main/java, src
+        Path candidate = base.resolve(sourcepath);
+        if (Files.exists(candidate)) return candidate.toString();
+        Path projectRoot = base;
+        // ascend until finds a pom.xml or build.gradle or reached filesystem root
+        Path cur = base;
+        while (cur != null && !Files.exists(cur.resolve("pom.xml")) && !Files.exists(cur.resolve("build.gradle")) && !Files.exists(cur.resolve("build.gradle.kts"))) {
+            cur = cur.getParent();
+        }
+        if (cur != null) {
+            Path try1 = cur.resolve("src/main/java").resolve(sourcepath);
+            if (Files.exists(try1)) return try1.toString();
+            Path try2 = cur.resolve("src").resolve(sourcepath);
+            if (Files.exists(try2)) return try2.toString();
+            Path try3 = cur.resolve(sourcepath);
+            if (Files.exists(try3)) return try3.toString();
+        }
+        // fallback: return provided sourcepath
+        return sourcepath;
+    }
+
+    private boolean isWindows() {
+        return System.getProperty("os.name").toLowerCase().contains("win");
+    }
+
+    private void outputReport() throws IOException {
+        if ("json".equalsIgnoreCase(reportFormat)) {
+            ObjectMapper mapper = new ObjectMapper();
+            System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(issues));
+        } else {
+            System.out.println("=== skills report ===");
+            for (Issue i : issues) {
+                System.out.printf("[%s] %s - %s:%d%n  %s%n", i.severity, i.code, i.file, i.line, i.message);
+                if (i.suggestion != null) System.out.println("  Suggestion: " + i.suggestion);
+                if (i.appliedFix) System.out.println("  Fix: auto-applied");
+                System.out.println();
+            }
+            if (issues.isEmpty()) {
+                System.out.println("No issues found.");
+            }
+        }
+    }
+
+    // helper classes
+    public static class Issue {
+        public Severity severity;
+        public String code;
+        public String message;
+        public String file;
+        public int line;
+        public String suggestion;
+        public String patch;
+        public boolean appliedFix = false;
+
+        public Issue() {}
+
+        public Issue(Severity severity, String code, String message, String file, int line) {
+            this.severity = severity;
+            this.code = code;
+            this.message = message;
+            this.file = file;
+            this.line = line;
+        }
+
+        public static Issue error(String code, String message, String file, int line) {
+            return new Issue(Severity.ERROR, code, message, file, line);
+        }
+
+        public static Issue warning(String code, String message, String file, int line) {
+            return new Issue(Severity.WARNING, code, message, file, line);
+        }
+
+        public static Issue info(String code, String message, String file, int line) {
+            return new Issue(Severity.INFO, code, message, file, line);
+        }
+    }
+
+    public enum Severity {
+        INFO, WARNING, ERROR
+    }
+
+    // Minimal property resolver wrapper for Checkstyle's loader
+    public static class PropertiesExpander implements PropertyResolver {
+        private final Properties props;
+        public PropertiesExpander(Properties props) { this.props = props; }
+        @Override
+        public String resolve(String name) { return props.getProperty(name); }
+    }
+}

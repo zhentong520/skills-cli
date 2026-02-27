@@ -1,0 +1,51 @@
+name: Auto-Fix Java Issues (prototype)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *' # 每天 03:00 运行（可删）
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  analyze-and-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install google-java-format (CLI)
+        run: |
+          curl -sL -o /usr/local/bin/google-java-format.jar https://github.com/google/google-java-format/releases/download/google-java-format-1.15.0/google-java-format-1.15.0-all-deps.jar
+          chmod +r /usr/local/bin/google-java-format.jar
+
+      - name: Install Node deps
+        run: |
+          npm ci
+        working-directory: .
+
+      - name: Run auto-fix script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DRY_RUN: "false" # 设置为 "true" 时只生成建议不提交
+        run: |
+          node ./scripts/auto-fix.js
