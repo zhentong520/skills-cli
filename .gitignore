@@ -1,0 +1,19 @@
+# Gradle
+.gradle/
+build/
+out/
+.gradle-cache/
+
+# IDE
+/.idea/
+/*.iml
+.vscode/
+
+# macOS
+.DS_Store
+
+# logs
+*.log
+
+# distribution
+*.zip
